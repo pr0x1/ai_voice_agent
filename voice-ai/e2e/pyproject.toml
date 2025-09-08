@@ -1,0 +1,29 @@
+[project]
+name = "voice-ai-e2e"
+version = "0.1.0"
+description = "Voice AI demo with OpenAI Realtime API's end-to-end model"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.116.1",
+    "uvicorn[standard]>=0.35.0",
+    "httpx>=0.28.1",
+    "python-multipart>=0.0.20",
+]
+
+[dependency-groups]
+dev = [
+    "black",
+    "ruff",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py38"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+ignore = []
+
+[tool.black]
+line-length = 88
+target-version = ["py38"]

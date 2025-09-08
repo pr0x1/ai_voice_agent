@@ -1,0 +1,30 @@
+[project]
+name = "voice-ai-chained"
+version = "0.1.0"
+description = "Voice AI demo with chained speech-to-text, LLM, and text-to-speech"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.116.1",
+    "uvicorn[standard]>=0.35.0",
+    "aiortc>=1.13.0",
+    "openai>=1.106.1",
+    "python-multipart>=0.0.20",
+]
+
+[dependency-groups]
+dev = [
+    "black",
+    "ruff",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py38"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+ignore = []
+
+[tool.black]
+line-length = 88
+target-version = ["py38"]

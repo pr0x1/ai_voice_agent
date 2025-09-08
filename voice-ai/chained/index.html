@@ -1,0 +1,689 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chained Pipeline Agent</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 600px;
+            margin: 50px auto;
+            padding: 20px;
+            text-align: center;
+        }
+        
+        button {
+            font-size: 18px;
+            padding: 15px 30px;
+            margin: 10px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+        
+        #startBtn {
+            background-color: #4CAF50;
+            color: white;
+        }
+        
+        #startBtn:hover {
+            background-color: #45a049;
+        }
+        
+        #startBtn:disabled {
+            background-color: #cccccc;
+            cursor: not-allowed;
+        }
+        
+        #status {
+            margin: 20px 0;
+            padding: 10px;
+            border-radius: 5px;
+            min-height: 20px;
+        }
+        
+        .status-info { background-color: #e7f3ff; color: #004085; }
+        .status-success { background-color: #d4edda; color: #155724; }
+        .status-error { background-color: #f8d7da; color: #721c24; }
+        .status-recording { background-color: #fff3cd; color: #856404; }
+        
+        #stopBtn {
+            background-color: #dc3545;
+            color: white;
+        }
+        
+        #stopBtn:hover {
+            background-color: #c82333;
+        }
+        
+        #vadStatus {
+            display: none;
+            font-size: 16px;
+            padding: 8px;
+            border-radius: 4px;
+            background-color: #f8f9fa;
+            border: 1px solid #dee2e6;
+            min-height: 20px;
+        }
+    </style>
+</head>
+<body>
+    <h1>Chained Pipeline Agent</h1>
+    <p>Click the "Start Voice Chat" button to start a voice conversation with the AI. Make sure your microphone is enabled and your browser has permission to access it.</p>
+    
+    <button id="startBtn" onclick="startVoiceChat()">Start Voice Chat</button>
+    <button id="stopBtn" onclick="stopVoiceChat()" style="display: none;">Stop Chat</button>
+    <div id="status"></div>
+    <div id="vadStatus" style="margin-top: 10px; font-weight: bold;"></div>
+
+    <script>
+        // =====================================================================
+        // Global State Variables
+        // =====================================================================
+        
+        let isRecording = false;
+        let mediaRecorder = null;
+        let audioStream = null;
+        let webrtcConnection = null;
+        let dataChannel = null;
+        let vadAnalyser = null;
+        let vadDataArray = null;
+        let speechDetectionTimer = null;
+        let silenceTimer = null;
+        let currentAudioChunks = [];
+        
+        // Audio chunk reassembly variables
+        let audioChunkBuffer = [];
+        let expectedChunks = 0;
+        let receivedChunks = 0;
+        let audioReassemblyInProgress = false;
+
+        // VAD Configuration
+        const VAD_THRESHOLD = 0.01; // Adjust sensitivity (0.001-0.1)
+        const SPEECH_START_DURATION = 300; // ms of speech to start recording
+        const SILENCE_DURATION = 1000; // ms of silence to stop recording
+        const SAMPLE_RATE = 16000; // Target sample rate for analysis
+        
+        // =====================================================================
+        // Utility Functions
+        // =====================================================================
+
+        function updateStatus(message, type = 'info') {
+            const status = document.getElementById('status');
+            status.textContent = message;
+            status.className = `status-${type}`;
+        }
+
+        function updateVADStatus(message, isActive = false) {
+            const vadStatus = document.getElementById('vadStatus');
+            vadStatus.textContent = message;
+            vadStatus.style.color = isActive ? '#d4351c' : '#505a5f';
+            vadStatus.style.display = message ? 'block' : 'none';
+        }
+        
+        // =====================================================================
+        // WebRTC Connection Management
+        // =====================================================================
+        
+        async function setupWebRTCConnection() {
+            /**
+             * Create and configure WebRTC peer connection with data channels.
+             * Returns the configured connection and data channel for sending audio.
+             */
+            // Create peer connection
+            const connection = new RTCPeerConnection({ iceServers: [] });
+            
+            // Create outbound data channel for sending audio to server
+            const outboundChannel = connection.createDataChannel("audio");
+            
+            // Set up outbound channel event handlers
+            outboundChannel.onerror = (error) => {
+                console.error('❌ Outbound data channel error:', error);
+            };
+            
+            return { connection, outboundChannel };
+        }
+        
+        function setupInboundAudioChannel(connection) {
+            /**
+             * Set up handler for incoming audio response channel from server.
+             * This channel receives AI-generated audio responses.
+             */
+            connection.ondatachannel = (event) => {
+                const receiveChannel = event.channel;
+                
+                if (receiveChannel.label !== 'audio_response') {
+                    console.warn('⚠️ Received unexpected data channel:', receiveChannel.label);
+                    return;
+                }
+                
+                // Handle incoming messages (audio responses)
+                receiveChannel.onmessage = handleIncomingAudioMessage;
+            };
+        }
+        
+        async function establishConnection(connection) {
+            /**
+             * Create WebRTC offer, send to server, and handle the response.
+             * Returns a promise that resolves when connection is established.
+             */
+            return new Promise(async (resolve, reject) => {
+                let connectionEstablished = false;
+                
+                // Handle ICE candidates and send offer when ready
+                connection.onicecandidate = (event) => {
+                    if (event.candidate === null && !connectionEstablished) {
+                        connectionEstablished = true;
+                        updateStatus('Connecting to server...', 'info');
+                        
+                        fetch("/offer", {
+                            method: "POST",
+                            headers: {"Content-Type": "application/json"},
+                            body: JSON.stringify(connection.localDescription)
+                        })
+                        .then(res => {
+                            if (!res.ok) throw new Error(`Server error: ${res.status}`);
+                            return res.json();
+                        })
+                        .then(answer => {
+                            connection.setRemoteDescription(answer);
+                            updateStatus('Connected! Listening for your voice...', 'success');
+                            updateVADStatus('Listening...', false);
+                            resolve();
+                        })
+                        .catch(err => {
+                            console.error('❌ Connection failed:', err);
+                            updateStatus(`Connection failed: ${err.message}`, 'error');
+                            reject(err);
+                        });
+                    }
+                };
+                
+                // Create and set local description
+                const offer = await connection.createOffer();
+                await connection.setLocalDescription(offer);
+                // Connection timeout
+                setTimeout(() => {
+                    if (!connectionEstablished) {
+                        updateStatus('Connection timeout - please try again', 'error');
+                        reject(new Error('Connection timeout'));
+                    }
+                }, 10_000); // 10 seconds
+            });
+        }
+        
+        // =====================================================================
+        // Voice Activity Detection (VAD)
+        // =====================================================================
+
+        function calculateAudioLevel(dataArray) {
+            /**
+             * Calculate the audio level from frequency domain data.
+             * Used to detect speech vs silence for Voice Activity Detection.
+             */
+            let sum = 0;
+            for (let i = 0; i < dataArray.length; i++) {
+                sum += Math.abs(dataArray[i] - 128);
+            }
+            return sum / dataArray.length / 128;
+        }
+        
+        async function setupVoiceActivityDetection() {
+            /**
+             * Set up audio analysis for Voice Activity Detection (VAD).
+             * Creates audio context and analyzer to monitor microphone input.
+             */
+            updateStatus('Setting up voice detection...', 'info');
+            
+            // Set up audio analysis for VAD
+            const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            const source = audioContext.createMediaStreamSource(audioStream);
+            vadAnalyser = audioContext.createAnalyser();
+            vadAnalyser.fftSize = 2048;
+            vadAnalyser.smoothingTimeConstant = 0.8;
+            source.connect(vadAnalyser);
+            
+            vadDataArray = new Uint8Array(vadAnalyser.frequencyBinCount);
+        }
+
+        function startSpeechDetection() {
+            /**
+             * Start the continuous speech detection loop.
+             * Monitors audio levels and automatically starts/stops recording.
+             */
+            if (!vadAnalyser) {
+                console.error('❌ VAD analyzer not available');
+                return;
+            }
+            
+            let frameCount = 0;
+            const detectSpeech = () => {
+                if (!isRecording) return;
+                
+                vadAnalyser.getByteTimeDomainData(vadDataArray);
+                const audioLevel = calculateAudioLevel(vadDataArray);
+                
+                // Log audio levels periodically (every 100 frames ~= every 1-2 seconds)
+                frameCount++;
+
+                if (audioLevel > VAD_THRESHOLD) {
+                    // Speech detected
+                    if (!speechDetectionTimer && !mediaRecorder) {
+                        updateVADStatus('Speech detected...', true);
+                        speechDetectionTimer = setTimeout(() => {
+                            startRecording();
+                            speechDetectionTimer = null;
+                        }, SPEECH_START_DURATION);
+                    }
+                    
+                    // Reset silence timer if we're currently recording
+                    if (mediaRecorder && mediaRecorder.state === 'recording') {
+                        clearTimeout(silenceTimer);
+                        silenceTimer = setTimeout(() => {
+                            stopRecording();
+                        }, SILENCE_DURATION);
+                    }
+                } else {
+                    // Silence detected
+                    if (speechDetectionTimer) {
+                        clearTimeout(speechDetectionTimer);
+                        speechDetectionTimer = null;
+                        updateVADStatus('Listening...', false);
+                    }
+                }
+                
+                requestAnimationFrame(detectSpeech);
+            };
+            
+            detectSpeech();
+        }
+        
+        // =====================================================================
+        // Audio Recording Functions
+        // =====================================================================
+        
+        async function setupMicrophoneAccess() {
+            /**
+             * Request microphone access with optimized settings for voice.
+             * Returns the audio stream for recording.
+             */
+            updateStatus('Requesting microphone access...', 'info');
+            
+            audioStream = await navigator.mediaDevices.getUserMedia({ 
+                audio: {
+                    echoCancellation: true,
+                    noiseSuppression: true,
+                    autoGainControl: true,
+                    sampleRate: SAMPLE_RATE
+                } 
+            });
+            
+            return audioStream;
+        }
+
+        function startRecording() {
+            if (!audioStream || !dataChannel || dataChannel.readyState !== 'open') {
+                console.error('❌ Prerequisites not met for recording');
+                updateStatus('Connection not ready for recording', 'error');
+                return;
+            }
+
+            updateVADStatus('Recording...', true);
+            updateStatus('Recording your speech...', 'recording');
+            
+            currentAudioChunks = [];
+            mediaRecorder = new MediaRecorder(audioStream, { 
+                mimeType: 'audio/webm;codecs=opus' 
+            });
+            
+            mediaRecorder.ondataavailable = (event) => {
+                if (event.data.size > 0) {
+                    currentAudioChunks.push(event.data);
+                }
+            };
+            
+            mediaRecorder.onstop = () => {
+                updateVADStatus('Processing...', false);
+                updateStatus('Processing your speech...', 'info');
+                
+                const audioBlob = new Blob(currentAudioChunks, { type: 'audio/webm' });
+                currentAudioChunks = [];
+                
+                audioBlob.arrayBuffer().then(buffer => {
+                    if (dataChannel && dataChannel.readyState === 'open') {
+                        dataChannel.send(buffer);
+                    } else {
+                        console.error('❌ Data channel not ready:', dataChannel?.readyState);
+                        updateStatus('Connection lost, please restart', 'error');
+                    }
+                });
+                
+                mediaRecorder = null;
+            };
+            
+            mediaRecorder.start();
+            
+            // Set silence detection timer
+            silenceTimer = setTimeout(() => {
+                console.log('⏰ Silence timeout, stopping recording');
+                stopRecording();
+            }, SILENCE_DURATION);
+        }
+
+        function stopRecording() {
+            if (mediaRecorder && mediaRecorder.state === 'recording') {
+                clearTimeout(silenceTimer);
+                mediaRecorder.stop();
+                updateVADStatus('Listening...', false);
+            }
+        }
+
+        async function handleAudioChunk(data) {
+            if (!audioReassemblyInProgress) {
+                console.warn('⚠️ Received audio chunk but not in reassembly mode');
+                return;
+            }
+
+            try {
+                // Convert data to ArrayBuffer if it's a Blob
+                let arrayBuffer;
+                if (data instanceof Blob) {
+                    arrayBuffer = await data.arrayBuffer();
+                } else if (data instanceof ArrayBuffer) {
+                    arrayBuffer = data;
+                } else {
+                    console.error('❌ Unexpected chunk data type:', typeof data, data);
+                    return;
+                }
+
+                // Parse chunk header (JSON line + binary data)
+                const view = new Uint8Array(arrayBuffer);
+                const newlineIndex = view.indexOf(10); // Find '\n' delimiter
+                
+                if (newlineIndex === -1) {
+                    console.error('❌ No delimiter found in chunk data');
+                    return;
+                }
+
+                // Extract header and data
+                const headerBytes = view.slice(0, newlineIndex);
+                const chunkData = view.slice(newlineIndex + 1);
+                const headerString = new TextDecoder().decode(headerBytes);
+                
+                const chunkInfo = JSON.parse(headerString);
+
+                // Store chunk in correct position
+                audioChunkBuffer[chunkInfo.chunk_index] = chunkData;
+                receivedChunks++;
+
+                // Update progress
+                const progress = Math.round((receivedChunks / expectedChunks) * 100);
+                updateStatus(`Receiving audio: ${progress}%`, 'success');
+            } catch (error) {
+                console.error('❌ Error handling audio chunk:', error);
+                updateStatus('Error processing audio chunk', 'error');
+                resetAudioReassembly();
+            }
+        }
+
+        async function assembleAndPlayAudio() {
+            if (!audioReassemblyInProgress || receivedChunks !== expectedChunks) {
+                console.error(`❌ Cannot assemble audio: received ${receivedChunks}/${expectedChunks} chunks`);
+                return;
+            }
+
+            try {
+                updateStatus('Assembling audio...', 'success');
+
+                // Check for missing chunks
+                for (let i = 0; i < expectedChunks; i++) {
+                    if (!audioChunkBuffer[i]) {
+                        throw new Error(`Missing audio chunk ${i}`);
+                    }
+                }
+
+                // Combine all chunks
+                const totalSize = audioChunkBuffer.reduce((sum, chunk) => sum + chunk.length, 0);
+                
+                const combinedArray = new Uint8Array(totalSize);
+                let offset = 0;
+
+                for (let i = 0; i < audioChunkBuffer.length; i++) {
+                    const chunk = audioChunkBuffer[i];
+                    combinedArray.set(chunk, offset);
+                    offset += chunk.length;
+                }
+                
+                // Create audio blob and play
+                const audioBlob = new Blob([combinedArray], { type: "audio/mpeg" });
+                await playAudioBlob(audioBlob);
+
+            } catch (error) {
+                console.error('❌ Error assembling audio:', error);
+                updateStatus('Failed to assemble audio', 'error');
+                updateVADStatus('Listening...', false);
+            } finally {
+                resetAudioReassembly();
+            }
+        }
+
+        async function playAudioBlob(audioBlob) {
+            try {
+                updateStatus('Playing AI response...', 'success');
+                updateVADStatus('AI Speaking...', false);
+                
+                const audioUrl = URL.createObjectURL(audioBlob);
+                
+                const audio = new Audio(audioUrl);
+                
+                // Configure audio
+                audio.volume = 1.0;
+                audio.preload = 'auto';
+                
+                audio.onended = () => {
+                    updateStatus('Listening for your voice...', 'success');
+                    updateVADStatus('Listening...', false);
+                    URL.revokeObjectURL(audioUrl);
+                };
+                
+                audio.onerror = (e) => {
+                    console.error('❌ Audio playback error:', e);
+                    console.log('🔍 Audio error details:', {
+                        error: audio.error,
+                        networkState: audio.networkState,
+                        readyState: audio.readyState
+                    });
+                    updateStatus('Audio playback failed', 'error');
+                    updateVADStatus('Listening...', false);
+                    URL.revokeObjectURL(audioUrl);
+                };
+                
+                // Try to play audio
+                const playPromise = audio.play();
+                if (playPromise) {
+                    playPromise.then(() => {
+                        console.log('✅ Audio play promise resolved successfully');
+                    }).catch(e => {
+                        console.error('❌ Audio play promise rejected:', e);
+                        updateStatus('Audio play failed - click to enable audio', 'error');
+                        
+                        // Create a user interaction button for autoplay issues
+                        const playBtn = document.createElement('button');
+                        playBtn.textContent = 'Click to Play Audio';
+                        playBtn.style.cssText = 'margin: 10px; padding: 10px; background: #007bff; color: white; border: none; border-radius: 5px; cursor: pointer;';
+                        playBtn.onclick = () => {
+                            audio.play().then(() => {
+                                document.body.removeChild(playBtn);
+                            }).catch(manualError => {
+                                console.error('❌ Manual play failed:', manualError);
+                            });
+                        };
+                        document.body.appendChild(playBtn);
+                    });
+                }
+                
+            } catch (error) {
+                console.error('❌ Audio handling error:', error);
+                updateStatus('Error playing audio response', 'error');
+                updateVADStatus('Listening...', false);
+            }
+        }
+
+        function resetAudioReassembly() {
+            audioChunkBuffer = [];
+            expectedChunks = 0;
+            receivedChunks = 0;
+            audioReassemblyInProgress = false;
+        }
+        
+        // =====================================================================
+        // Audio Playback Functions
+        // =====================================================================
+        
+        async function handleIncomingAudioMessage(evt) {
+            /**
+             * Handle incoming messages from the server's audio response channel.
+             * Processes both protocol messages and audio chunk data.
+             */
+            try {
+                if (typeof evt.data === 'string') {
+                    // Handle protocol messages
+                    const message = JSON.parse(evt.data);
+                    
+                    switch (message.type) {
+                        case 'audio_start':
+                            audioChunkBuffer = new Array(message.total_chunks);
+                            expectedChunks = message.total_chunks;
+                            receivedChunks = 0;
+                            audioReassemblyInProgress = true;
+                            updateStatus('Receiving AI response...', 'success');
+                            updateVADStatus('AI Responding...', false);
+                            break;
+                            
+                        case 'audio_complete':
+                            await assembleAndPlayAudio();
+                            break;
+                            
+                        case 'audio_error':
+                            console.error('Audio transmission error:', message.error);
+                            updateStatus(`Audio error: ${message.error}`, 'error');
+                            updateVADStatus('Listening...', false);
+                            resetAudioReassembly();
+                            break;
+                            
+                        default:
+                            console.log('Unknown protocol message:', message);
+                            break;
+                    }
+                } else if (evt.data instanceof ArrayBuffer || evt.data instanceof Blob) {
+                    // Handle audio chunk data
+                    await handleAudioChunk(evt.data);
+                } else {
+                    console.warn('❌ Unexpected data type:', typeof evt.data, evt.data);
+                }
+            } catch (error) {
+                console.error('Message handling error:', error);
+                updateStatus('Error processing server response', 'error');
+                updateVADStatus('Listening...', false);
+                resetAudioReassembly();
+            }
+        }
+
+        // =====================================================================
+        // Main Voice Chat Orchestration
+        // =====================================================================
+        
+        async function startVoiceChat() {
+            /**
+             * Main function to start the voice chat session.
+             * Orchestrates WebRTC setup, microphone access, and voice detection.
+             */
+            const startBtn = document.getElementById('startBtn');
+            const stopBtn = document.getElementById('stopBtn');
+            
+            startBtn.style.display = 'none';
+            stopBtn.style.display = 'inline-block';
+            isRecording = true;
+            
+            updateStatus('Initializing voice chat...', 'info');
+
+            try {
+                // Step 1: Set up WebRTC peer connection and data channels
+                const { connection, outboundChannel } = await setupWebRTCConnection();
+                webrtcConnection = connection;
+                dataChannel = outboundChannel;
+                
+                // Step 2: Set up incoming audio channel handler
+                setupInboundAudioChannel(webrtcConnection);
+                
+                // Step 3: Get microphone access
+                await setupMicrophoneAccess();
+                
+                // Step 4: Set up voice activity detection
+                await setupVoiceActivityDetection();
+                
+                // Step 5: Establish WebRTC connection with server
+                await establishConnection(webrtcConnection);
+                
+                // Step 6: Start listening for voice activity
+                startSpeechDetection();
+            } catch (error) {
+                updateStatus(`Error: ${error.message}`, 'error');
+                console.error('Voice chat error:', error);
+                stopVoiceChat();
+            }
+        }
+
+        function stopVoiceChat() {
+            const startBtn = document.getElementById('startBtn');
+            const stopBtn = document.getElementById('stopBtn');
+            
+            isRecording = false;
+            startBtn.style.display = 'inline-block';
+            stopBtn.style.display = 'none';
+            
+            // Clean up timers
+            clearTimeout(speechDetectionTimer);
+            clearTimeout(silenceTimer);
+            speechDetectionTimer = null;
+            silenceTimer = null;
+            
+            // Stop current recording if active
+            if (mediaRecorder && mediaRecorder.state === 'recording') {
+                mediaRecorder.stop();
+            }
+            
+            // Close audio stream
+            if (audioStream) {
+                audioStream.getTracks().forEach(track => track.stop());
+                audioStream = null;
+            }
+            
+            // Close WebRTC connection
+            if (webrtcConnection) {
+                webrtcConnection.close();
+                webrtcConnection = null;
+            }
+            
+            dataChannel = null;
+            vadAnalyser = null;
+            vadDataArray = null;
+            mediaRecorder = null;
+            currentAudioChunks = [];
+            
+            // Reset audio reassembly state
+            resetAudioReassembly();
+            
+            updateStatus('Voice chat stopped', 'info');
+            updateVADStatus('', false);
+        }
+
+        // Initialize UI on page load
+        document.addEventListener('DOMContentLoaded', () => {
+            updateStatus('Ready to connect', 'info');
+        });
+    </script>
+</body>
+</html>

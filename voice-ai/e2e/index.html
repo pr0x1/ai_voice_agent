@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>End-to-End Agent</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 600px;
+            margin: 50px auto;
+            padding: 20px;
+            text-align: center;
+        }
+        
+        button {
+            font-size: 18px;
+            padding: 15px 30px;
+            margin: 10px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+        
+        #startButton {
+            background-color: #4CAF50;
+            color: white;
+        }
+        
+        #startButton:hover {
+            background-color: #45a049;
+        }
+        
+        #startButton:disabled {
+            background-color: #cccccc;
+            cursor: not-allowed;
+        }
+        
+        #status {
+            margin: 20px 0;
+            padding: 10px;
+            border-radius: 5px;
+            min-height: 20px;
+        }
+        
+        .status-info { background-color: #e7f3ff; color: #004085; }
+        .status-success { background-color: #d4edda; color: #155724; }
+        .status-error { background-color: #f8d7da; color: #721c24; }
+        .status-connecting { background-color: #fff3cd; color: #856404; }
+        
+        #stopButton {
+            background-color: #dc3545;
+            color: white;
+        }
+        
+        #stopButton:hover {
+            background-color: #c82333;
+        }
+    </style>
+</head>
+<body>
+    <h1>End-to-End Agent</h1>
+    <p>Click the "Start Voice Chat" button to start a voice conversation with the AI. Make sure your microphone is enabled and your browser has permission to access it.</p>
+    
+    <button id="startButton" onclick="startVoiceChat()">Start Voice Chat</button>
+    <button id="stopButton" onclick="stopVoiceChat()" style="display: none;">Stop Chat</button>
+    <div id="status"></div>
+
+    <script>
+        // =====================================================================
+        // Global State Variables
+        // =====================================================================
+        
+        let audioElement = null;
+        let isConnected = false;
+        let peerConnection = null;
+        let mediaStream = null;
+
+        // =====================================================================
+        // Utility Functions
+        // =====================================================================
+
+        function updateStatus(message, type = 'info') {
+            const status = document.getElementById('status');
+            status.textContent = message;
+            status.className = `status-${type}`;
+        }
+
+        function updateUI(status) {
+            const startButton = document.getElementById('startButton');
+            const stopButton = document.getElementById('stopButton');
+            
+            switch(status) {
+                case 'disconnected':
+                    startButton.style.display = 'inline-block';
+                    stopButton.style.display = 'none';
+                    startButton.disabled = false;
+                    updateStatus('Ready to connect', 'info');
+                    break;
+                case 'connecting':
+                    startButton.disabled = true;
+                    updateStatus('Connecting to AI...', 'connecting');
+                    break;
+                case 'connected':
+                    startButton.style.display = 'none';
+                    stopButton.style.display = 'inline-block';
+                    updateStatus('Connected! Start talking to the AI', 'success');
+                    break;
+                case 'error':
+                    startButton.style.display = 'inline-block';
+                    stopButton.style.display = 'none';
+                    startButton.disabled = false;
+                    updateStatus('Connection failed. Check console for details.', 'error');
+                    break;
+            }
+        }
+
+        // =====================================================================
+        // Voice Chat Functions
+        // =====================================================================
+
+        function stopVoiceChat() {
+            // Close peer connection
+            if (peerConnection) {
+                peerConnection.close();
+                peerConnection = null;
+            }
+            
+            // Stop media stream
+            if (mediaStream) {
+                mediaStream.getTracks().forEach(track => track.stop());
+                mediaStream = null;
+            }
+            
+            // Stop audio playback
+            if (audioElement) {
+                audioElement.srcObject = null;
+                audioElement = null;
+            }
+            
+            // Reset state
+            isConnected = false;
+            updateUI('disconnected');
+            
+            console.log('Voice chat stopped');
+        }
+
+        async function startVoiceChat() {
+            try {
+                updateUI('connecting');
+
+                // Get an ephemeral token for OpenAI Realtime API
+                const tokenResponse = await fetch("/token");
+                const data = await tokenResponse.json();
+                const EPHEMERAL_KEY = data.value;
+
+                // Create a peer connection
+                peerConnection = new RTCPeerConnection();
+
+                // Set up to play remote audio from the model
+                audioElement = document.createElement("audio");
+                audioElement.autoplay = true;
+                peerConnection.ontrack = (e) => {
+                    audioElement.srcObject = e.streams[0];
+                };
+
+                // Add local audio track for microphone input in the browser
+                mediaStream = await navigator.mediaDevices.getUserMedia({
+                    audio: true,
+                });
+                peerConnection.addTrack(mediaStream.getTracks()[0]);
+
+                // Set up data channel for sending and receiving events
+                const dc = peerConnection.createDataChannel("oai-events");
+
+                // Start the session using the Session Description Protocol (SDP)
+                const offer = await peerConnection.createOffer();
+                await peerConnection.setLocalDescription(offer);
+
+                const baseUrl = "https://api.openai.com/v1/realtime/calls";
+                const model = "gpt-realtime";
+                const sdpResponse = await fetch(`${baseUrl}?model=${model}`, {
+                    method: "POST",
+                    body: offer.sdp,
+                    headers: {
+                        Authorization: `Bearer ${EPHEMERAL_KEY}`,
+                        "Content-Type": "application/sdp",
+                    },
+                });
+
+                const answer = {
+                    type: "answer",
+                    sdp: await sdpResponse.text(),
+                };
+                await peerConnection.setRemoteDescription(answer);
+
+                // Connection successful
+                isConnected = true;
+                updateUI('connected');
+                
+                // Handle connection state changes
+                peerConnection.onconnectionstatechange = () => {
+                    console.log('Connection state:', peerConnection.connectionState);
+                    if (peerConnection.connectionState === 'disconnected' || 
+                        peerConnection.connectionState === 'failed' ||
+                        peerConnection.connectionState === 'closed') {
+                        if (isConnected) {
+                            stopVoiceChat();
+                        }
+                    }
+                };
+
+            } catch (error) {
+                console.error('Error starting voice chat:', error);
+                updateUI('error');
+            }
+        }
+
+        // Initialize UI on page load
+        document.addEventListener('DOMContentLoaded', () => {
+            updateUI('disconnected');
+        });
+    </script>
+</body>
+</html>
