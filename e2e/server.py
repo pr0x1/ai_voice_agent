@@ -24,6 +24,9 @@ current_dir = Path(__file__).parent
 # Serve static files from current directory
 app.mount("/static", StaticFiles(directory=current_dir), name="static")
 
+with open("sap_sales_assistant_instructions.md", "r", encoding="utf-8") as f:
+    assistant_instructions = f.read()
+
 # Also serve index.html at root
 @app.get("/")
 async def serve_index():
@@ -39,8 +42,18 @@ session_config = {
                 "voice": "marin",
             },
         },
+        "instructions": assistant_instructions,
+        "tools": [
+            {
+                "type": "mcp",
+                "server_label": "SAPMCP",
+                "server_url": "https://cap-agent-flow.cfapps.us10-001.hana.ondemand.com/mcp",
+                "require_approval": "never",
+            }
+        ],
     },
 }
+
 
 # An endpoint which would work with the client code above - it returns
 # the contents of a REST API request to this protected endpoint
